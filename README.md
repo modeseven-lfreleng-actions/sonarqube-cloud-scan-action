@@ -208,8 +208,66 @@ For information on the build wrapper for C language based projects:
 | scanner_version       | False    | (uses SonarSource action's default) | Version of the Sonar Scanner CLI to use                                                                                                |
 | skip_jre_provisioning | False    | false                               | Skip JRE auto-provisioning by the Sonar Scanner CLI (see note below)                                                                   |
 | args                  | False    | -Dsonar.scanner.cache.enabled=false | Arguments to pass to the Sonar Scanner CLI                                                                                             |
+| sonar_organization    | False    | ''                                  | Override the SonarQube organization (sonar.organization)                                                                               |
+| sonar_project_key     | False    | ''                                  | Override the SonarQube project key (sonar.projectKey)                                                                                  |
+| sonar_branch_name     | False    | ''                                  | Analysis branch name (sonar.branch.name); useful for Gerrit decoration                                                                 |
+| sonar_branch_target   | False    | ''                                  | Analysis target branch (sonar.branch.target); useful for Gerrit decoration                                                             |
+| wait_for_quality_gate | False    | false                               | Poll the SonarQube quality gate after the analysis task completes                                                                      |
+| fail_on_quality_gate  | False    | false                               | Fail the action when the quality gate status is not OK (requires wait_for_quality_gate: true)                                          |
 
 <!-- markdownlint-enable MD013 -->
+
+## Outputs
+
+<!-- markdownlint-disable MD013 -->
+
+| Output Name         | Description                                             |
+| ------------------- | ------------------------------------------------------- |
+| sonar_org           | SonarQube organization                                  |
+| project_key         | SonarQube project key                                   |
+| config_file         | Path to the SonarQube configuration file                |
+| dashboard_url       | SonarQube dashboard URL for the analysed project        |
+| quality_gate_status | Quality gate status (see values below)                  |
+
+<!-- markdownlint-enable MD013 -->
+
+### Note: Quality gate evaluation
+
+Set `wait_for_quality_gate: 'true'` to poll the background analysis
+task after the scan and read the resulting quality gate status. The
+`quality_gate_status` output carries the result and defaults to
+`UNKNOWN`. The job summary adds a quality-gate line when polling runs
+(`wait_for_quality_gate: 'true'`). Set `fail_on_quality_gate: 'true'` to
+fail the action when the
+quality gate status is not `OK`. `fail_on_quality_gate` takes effect
+when `wait_for_quality_gate` is also `true`, because the action must
+poll the gate before it can act on the result. Evaluation relies on
+`jq`; runners that lack `jq` skip the gate and report `UNKNOWN`. When the
+action cannot resolve the gate before polling (missing `jq`, report task
+file, `ceTaskUrl`, `serverUrl`, or a missing/malformed `sonar_token`), it
+reports `UNKNOWN` and continues without failing, even with
+`fail_on_quality_gate: 'true'`.
+
+The `quality_gate_status` output takes one of the following values:
+
+- `OK` — the quality gate passed.
+- `ERROR` — the quality gate failed.
+- `NONE` — SonarQube reports no quality gate assigned to the project.
+- `UNKNOWN` — the gate could not resolve (evaluation skipped, the
+  analysis task did not complete, or the API request failed). The
+  output also defaults to `UNKNOWN` when `wait_for_quality_gate` is
+  `false`.
+
+### Note: Gerrit branch decoration
+
+The `sonar_branch_name` and `sonar_branch_target` inputs map to the
+`sonar.branch.name` and `sonar.branch.target` analysis properties. Plain
+GitHub pull-request analysis derives branch context automatically, so
+reserve these inputs for Gerrit or other non-GitHub source platforms
+that need to name the branch under analysis. Set `sonar_branch_name`
+whenever you set `sonar_branch_target`: SonarQube honours the target
+branch when the analysis names its branch, and otherwise treats the run
+as the main branch and ignores the target.
 
 ### Note: JRE auto-provisioning
 

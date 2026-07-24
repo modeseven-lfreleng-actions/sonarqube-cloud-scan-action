@@ -80,6 +80,31 @@ inputs:
     description: 'Arguments to pass to the Sonar Scanner CLI (e.g., "-Dsonar.verbose=true")'
     required: false
     default: '-Dsonar.scanner.cache.enabled=false'
+  sonar_organization:
+    description: 'Override the SonarQube organization (sonar.organization)'
+    required: false
+    default: ''
+  sonar_project_key:
+    description: 'Override the SonarQube project key (sonar.projectKey)'
+    required: false
+    default: ''
+  sonar_branch_name:
+    description: 'Analysis branch name (sonar.branch.name); useful for Gerrit decoration'
+    required: false
+    default: ''
+  sonar_branch_target:
+    description: 'Analysis target branch (sonar.branch.target); useful for Gerrit decoration'
+    required: false
+    default: ''
+  wait_for_quality_gate:
+    description: 'Poll the SonarQube quality gate after the analysis task completes'
+    required: false
+    default: 'false'
+  fail_on_quality_gate:
+    # yamllint disable-line rule:line-length
+    description: 'Fail the action when the quality gate status is not OK. Requires wait_for_quality_gate: true, and takes effect only when the gate can actually be evaluated (skipped without failing when jq, the report task file, ceTaskUrl, serverUrl, or a valid sonar_token are missing)'
+    required: false
+    default: 'false'
 
 outputs:
   sonar_org:
@@ -91,6 +116,12 @@ outputs:
   config_file:
     description: 'Path to SonarQube configuration file'
     value: ${{ steps.sonar-config.outputs.config_file }}
+  dashboard_url:
+    description: 'SonarQube dashboard URL for the analysed project'
+    value: ${{ steps.summary.outputs.dashboard_url }}
+  quality_gate_status:
+    description: 'Quality gate status (OK, ERROR, NONE, or UNKNOWN)'
+    value: ${{ steps.quality-gate.outputs.quality_gate_status || 'UNKNOWN' }}
 
 runs:
   using: 'composite'
@@ -116,6 +147,8 @@ runs:
         PROJECT_BASE_DIR: ${{ inputs.project_base_dir }}
         REPO_OWNER: ${{ steps.repository-metadata.outputs.repository_owner }}
         REPO_NAME: ${{ steps.repository-metadata.outputs.repository_name }}
+        SONAR_ORG_OVERRIDE: ${{ inputs.sonar_organization }}
+        PROJECT_KEY_OVERRIDE: ${{ inputs.sonar_project_key }}
       run: |
         # Process SonarQube configuration
         SONAR_PROPS="$PROJECT_BASE_DIR/sonar-project.properties"
@@ -148,15 +181,46 @@ runs:
           echo '### SonarQube configuration present ✅' >> "$GITHUB_STEP_SUMMARY"
         fi
 
-        # Set config_file as step output after potential file creation
-        echo "config_file=$CONFIG_FILE" >> "$GITHUB_OUTPUT"
+        # Set config_file as step output after potential file creation.
+        # CONFIG_FILE derives from the user-controlled project_base_dir input,
+        # so use the multiline (delimiter) form to stop a newline in the path
+        # from corrupting the output file or injecting extra outputs.
+        CFG_DELIM="CFG_EOF_${RANDOM}${RANDOM}"
+        {
+          echo "config_file<<${CFG_DELIM}"
+          echo "$CONFIG_FILE"
+          echo "${CFG_DELIM}"
+        } >> "$GITHUB_OUTPUT"
 
         # Extract and output configuration values (strip whitespace and quotes)
         SONAR_ORG=$(grep -E "^sonar.organization=" "$CONFIG_FILE" | cut -d'=' -f2- | xargs || echo "")
         SONAR_PROJECT_KEY=$(grep -E "^sonar.projectKey=" "$CONFIG_FILE" | cut -d'=' -f2- | xargs || echo "")
 
-        echo "sonar_org=$SONAR_ORG" >> "$GITHUB_OUTPUT"
-        echo "project_key=$SONAR_PROJECT_KEY" >> "$GITHUB_OUTPUT"
+        # Override inputs win, so the outputs match the project actually
+        # analysed when a caller sets sonar_organization/sonar_project_key.
+        if [ -n "$SONAR_ORG_OVERRIDE" ]; then
+          SONAR_ORG="$SONAR_ORG_OVERRIDE"
+        fi
+        if [ -n "$PROJECT_KEY_OVERRIDE" ]; then
+          SONAR_PROJECT_KEY="$PROJECT_KEY_OVERRIDE"
+        fi
+
+        # sonar_org/project_key can come from user-controlled inputs or a
+        # repo config file. Write them with the multiline (delimiter) form,
+        # as with args/dashboard_url, so a value containing a newline cannot
+        # spoof additional outputs for downstream steps/workflows.
+        ORG_DELIM="ORG_EOF_${RANDOM}${RANDOM}"
+        {
+          echo "sonar_org<<${ORG_DELIM}"
+          echo "$SONAR_ORG"
+          echo "${ORG_DELIM}"
+        } >> "$GITHUB_OUTPUT"
+        KEY_DELIM="KEY_EOF_${RANDOM}${RANDOM}"
+        {
+          echo "project_key<<${KEY_DELIM}"
+          echo "$SONAR_PROJECT_KEY"
+          echo "${KEY_DELIM}"
+        } >> "$GITHUB_OUTPUT"
 
         if [ -n "$SONAR_ORG" ]; then
           echo "- **Organization**: $SONAR_ORG" >> "$GITHUB_STEP_SUMMARY"
@@ -291,6 +355,57 @@ runs:
           ls -la "$PROJECT_BASE_DIR" || echo "Project base dir not found"
         fi
 
+    - name: 'Build scanner arguments'
+      id: scan-args
+      shell: bash
+      env:
+        BASE_ARGS: ${{ inputs.args }}
+        SONAR_ORG_OVERRIDE: ${{ inputs.sonar_organization }}
+        PROJECT_KEY_OVERRIDE: ${{ inputs.sonar_project_key }}
+        BRANCH_NAME: ${{ inputs.sonar_branch_name }}
+        BRANCH_TARGET: ${{ inputs.sonar_branch_target }}
+      run: |
+        # Assemble the Sonar Scanner CLI arguments
+        set -euo pipefail
+        ARGS="$BASE_ARGS"
+        # The override/branch inputs are documented as simple identity and
+        # branch fields and are interpolated into single -Dkey=value tokens.
+        # Reject whitespace/control characters so a crafted value cannot
+        # split into extra scanner CLI arguments (flag injection); advanced
+        # multi-flag usage belongs in the 'args' input instead.
+        validate_token() {
+          case "$2" in
+            *[[:space:][:cntrl:]]*)
+              echo "❌ $1 must not contain whitespace or control characters; use the 'args' input for advanced scanner flags" >&2
+              exit 1
+              ;;
+          esac
+        }
+        validate_token 'sonar_organization' "$SONAR_ORG_OVERRIDE"
+        validate_token 'sonar_project_key' "$PROJECT_KEY_OVERRIDE"
+        validate_token 'sonar_branch_name' "$BRANCH_NAME"
+        validate_token 'sonar_branch_target' "$BRANCH_TARGET"
+        if [ -n "$SONAR_ORG_OVERRIDE" ]; then
+          ARGS="$ARGS -Dsonar.organization=$SONAR_ORG_OVERRIDE"
+        fi
+        if [ -n "$PROJECT_KEY_OVERRIDE" ]; then
+          ARGS="$ARGS -Dsonar.projectKey=$PROJECT_KEY_OVERRIDE"
+        fi
+        if [ -n "$BRANCH_NAME" ]; then
+          ARGS="$ARGS -Dsonar.branch.name=$BRANCH_NAME"
+        fi
+        if [ -n "$BRANCH_TARGET" ]; then
+          ARGS="$ARGS -Dsonar.branch.target=$BRANCH_TARGET"
+        fi
+        # Use the multiline (delimiter) output form so a newline in any
+        # input value cannot break the output file or inject extra outputs.
+        ARGS_DELIM="ARGS_EOF_${RANDOM}${RANDOM}"
+        {
+          echo "args<<${ARGS_DELIM}"
+          echo "$ARGS"
+          echo "${ARGS_DELIM}"
+        } >> "$GITHUB_OUTPUT"
+
     - name: 'SonarQube Scan'
       id: sonar-scan
 
@@ -305,7 +420,7 @@ runs:
       with:
         projectBaseDir: ${{ inputs.project_base_dir }}
         scannerVersion: ${{ inputs.scanner_version || '7.2.0.5079' }}
-        args: ${{ inputs.args }}
+        args: ${{ steps.scan-args.outputs.args }}
 
     - name: 'Parse scan output'
       id: parse-output
@@ -329,10 +444,141 @@ runs:
           echo "not_bound=false" >> "$GITHUB_OUTPUT"
         fi
 
-        # Output report file path for reuse in subsequent steps
-        echo "report_task_file=$REPORT_TASK_FILE" >> "$GITHUB_OUTPUT"
+        # Output report file path for reuse in subsequent steps.
+        # REPORT_TASK_FILE derives from the user-controlled project_base_dir
+        # input, so use the multiline (delimiter) form to stop a newline in
+        # the path from corrupting the output file or injecting extra outputs.
+        RTF_DELIM="RTF_EOF_${RANDOM}${RANDOM}"
+        {
+          echo "report_task_file<<${RTF_DELIM}"
+          echo "$REPORT_TASK_FILE"
+          echo "${RTF_DELIM}"
+        } >> "$GITHUB_OUTPUT"
+
+    - name: 'Evaluate quality gate'
+      id: quality-gate
+      if: inputs.wait_for_quality_gate == 'true'
+      shell: bash
+      env:
+        SONAR_TOKEN: ${{ inputs.sonar_token }}
+        REPORT_TASK_FILE_PATH: ${{ steps.parse-output.outputs.report_task_file }}
+        FAIL_ON_QG: ${{ inputs.fail_on_quality_gate }}
+      run: |
+        # Poll the compute-engine task, then read the quality gate status
+        set -euo pipefail
+        REPORT_TASK_FILE="$REPORT_TASK_FILE_PATH"
+        QG_STATUS="UNKNOWN"
+
+        if [ ! -f "$REPORT_TASK_FILE" ]; then
+          echo '⚠️ Report task file not found; skipping quality gate'
+          echo "quality_gate_status=$QG_STATUS" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+
+        # jq drives the API parsing; on minimal or self-hosted runners it
+        # may be absent. Skip the gate (report UNKNOWN) instead of failing.
+        if ! command -v jq >/dev/null 2>&1; then
+          echo '⚠️ jq not found; skipping quality gate evaluation'
+          echo "quality_gate_status=$QG_STATUS" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+
+        CE_TASK_URL=$(grep -E '^ceTaskUrl=' "$REPORT_TASK_FILE" | cut -d'=' -f2- || echo '')
+        SERVER_URL=$(grep -E '^serverUrl=' "$REPORT_TASK_FILE" | cut -d'=' -f2- || echo '')
+        # ceTaskUrl and serverUrl are both prerequisites: without them the
+        # compute-engine poll and the quality-gate API URL cannot be built.
+        # Skip evaluation gracefully (report UNKNOWN, exit 0) rather than
+        # issuing a malformed request that would leave QG_STATUS=UNKNOWN and
+        # fail the action under fail_on_quality_gate for a gate that was
+        # never actually evaluable.
+        if [ -z "$CE_TASK_URL" ] || [ -z "$SERVER_URL" ]; then
+          echo '⚠️ ceTaskUrl/serverUrl missing from report; skipping quality gate'
+          echo "quality_gate_status=$QG_STATUS" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+
+        # SONAR_TOKEN is embedded, inside double quotes, in a curl config
+        # file built on stdin. A token containing whitespace, control
+        # characters, or a double quote would break the config syntax or
+        # inject extra curl directives, so reject those (and an empty token)
+        # and skip the gate gracefully rather than issue a malformed request.
+        case "$SONAR_TOKEN" in
+          '' | *[[:space:][:cntrl:]]* | *'"'*)
+            echo '⚠️ SONAR_TOKEN missing or malformed; skipping quality gate'
+            echo "quality_gate_status=$QG_STATUS" >> "$GITHUB_OUTPUT"
+            exit 0
+            ;;
+        esac
+
+        # Authenticated GET that keeps the token out of the process argument
+        # list. Passing -u "$SONAR_TOKEN:" would expose the secret in `ps`
+        # output on shared/self-hosted runners, so the credential is fed to
+        # curl via a config file on stdin (-K -) instead. Bounded timeouts
+        # (-f --connect-timeout --max-time) stop a stalled network or hung
+        # endpoint from wedging the step indefinitely.
+        sonar_get() {
+          printf 'user = "%s:"\n' "$SONAR_TOKEN" \
+            | curl -K - -f --connect-timeout 10 --max-time 60 -s -- "$1"
+        }
+
+        ANALYSIS_ID=''
+        ATTEMPTS=0
+        MAX_ATTEMPTS=30
+        while [ "$ATTEMPTS" -lt "$MAX_ATTEMPTS" ]; do
+          # Fall back to {} on curl failure so jq stays deterministic and
+          # the loop keeps retrying instead of failing under pipefail.
+          TASK_JSON=$(sonar_get "$CE_TASK_URL" || echo '{}')
+          TASK_STATUS=$(echo "$TASK_JSON" | jq -r '.task.status // empty' 2>/dev/null || echo '')
+          if [ "$TASK_STATUS" = 'SUCCESS' ]; then
+            ANALYSIS_ID=$(echo "$TASK_JSON" | jq -r '.task.analysisId // empty' 2>/dev/null || echo '')
+            break
+          fi
+          if [ "$TASK_STATUS" = 'FAILED' ] || [ "$TASK_STATUS" = 'CANCELED' ]; then
+            echo "❌ Background analysis task ended with status: $TASK_STATUS"
+            break
+          fi
+          ATTEMPTS=$((ATTEMPTS + 1))
+          # Sleep between polls, but not after the final attempt (no further
+          # poll follows, so the extra delay would be wasted).
+          if [ "$ATTEMPTS" -lt "$MAX_ATTEMPTS" ]; then
+            sleep 5
+          fi
+        done
+
+        if [ -n "$ANALYSIS_ID" ]; then
+          QG_URL="${SERVER_URL%/}/api/qualitygates/project_status?analysisId=${ANALYSIS_ID}"
+          # Fall back to {} on curl failure so the jq default yields UNKNOWN.
+          QG_JSON=$(sonar_get "$QG_URL" || echo '{}')
+          QG_STATUS=$(echo "$QG_JSON" | jq -r '.projectStatus.status // "UNKNOWN"' 2>/dev/null || echo 'UNKNOWN')
+        fi
+
+        # Constrain the status to the documented enum before exporting it.
+        # QG_STATUS comes from an external API response, so a compromised or
+        # self-hosted endpoint returning an unexpected (possibly multiline)
+        # value must not be forwarded verbatim into $GITHUB_OUTPUT, where it
+        # could inject additional outputs for downstream steps.
+        case "$QG_STATUS" in
+          OK | ERROR | NONE | UNKNOWN) ;;
+          *) QG_STATUS='UNKNOWN' ;;
+        esac
+
+        echo "Quality gate status: $QG_STATUS"
+        echo "quality_gate_status=$QG_STATUS" >> "$GITHUB_OUTPUT"
+
+        if [ "$FAIL_ON_QG" = 'true' ] && [ "$QG_STATUS" != 'OK' ]; then
+          if [ "$QG_STATUS" = 'UNKNOWN' ]; then
+            echo "❌ Quality gate could not be evaluated (status: UNKNOWN); failing because fail_on_quality_gate is enabled"
+          else
+            echo "❌ Quality gate failed with status: $QG_STATUS"
+          fi
+          exit 1
+        fi
 
     - name: 'Print summary/job output'
+      id: summary
+      # Run even when a prior step (for example the quality gate) fails, so
+      # the dashboard link and status still reach the job summary/outputs.
+      if: always()
       shell: bash
       # yamllint disable rule:line-length
       env:
@@ -342,6 +588,8 @@ runs:
         REPO_OWNER: ${{ steps.repository-metadata.outputs.repository_owner }}
         REPO_NAME: ${{ steps.repository-metadata.outputs.repository_name }}
         NOT_BOUND: ${{ steps.parse-output.outputs.not_bound }}
+        QG_STATUS: ${{ steps.quality-gate.outputs.quality_gate_status }}
+        SONAR_HOST_URL: ${{ inputs.sonar_host_url }}
       run: |
         # Print summary/job output
         # Extract the dashboard URL from .scannerwork/report-task.txt if available
@@ -353,17 +601,24 @@ runs:
         PROJECT_KEY="$PROJECT_KEY_IN"
 
         # Extract dashboard URL from report-task.txt
+        SERVER_URL=""
         if [ -f "$REPORT_TASK_FILE" ]; then
           DASHBOARD_URL=$(grep -E "^dashboardUrl=" "$REPORT_TASK_FILE" | cut -d'=' -f2-)
+          SERVER_URL=$(grep -E "^serverUrl=" "$REPORT_TASK_FILE" | cut -d'=' -f2-)
         fi
 
-        # Fallback to constructing URL if not found in report-task.txt
+        # Fallback to constructing URL if not found in report-task.txt.
+        # Derive the base host from serverUrl= in report-task.txt (preferred),
+        # then the sonar_host_url input, only defaulting to SonarCloud when
+        # neither is set, so self-hosted SonarQube links stay correct.
         if [ -z "$DASHBOARD_URL" ]; then
+          BASE_URL="${SERVER_URL:-${SONAR_HOST_URL:-https://sonarcloud.io}}"
+          BASE_URL="${BASE_URL%/}"
           if [ -n "$PROJECT_KEY" ]; then
-            DASHBOARD_URL="https://sonarcloud.io/dashboard?id=${PROJECT_KEY}"
+            DASHBOARD_URL="${BASE_URL}/dashboard?id=${PROJECT_KEY}"
           else
             # Last resort: use repository metadata
-            DASHBOARD_URL="https://sonarcloud.io/project/overview?id=${REPO_OWNER}_${REPO_NAME}"
+            DASHBOARD_URL="${BASE_URL}/project/overview?id=${REPO_OWNER}_${REPO_NAME}"
           fi
         fi
 
@@ -380,8 +635,32 @@ runs:
           echo "Debug: Final dashboard URL: $DASHBOARD_URL"
         fi
 
-        echo '## 🔐 SonarQube Cloud Scan Results Updated' >> "$GITHUB_STEP_SUMMARY"
+        # The summary step runs with if: always(), so it can execute even
+        # when the scan step failed and produced no report-task.txt. Use a
+        # header that reflects the actual outcome rather than always claiming
+        # a successful upload.
+        if [ -f "$REPORT_TASK_FILE" ]; then
+          echo '## 🔐 SonarQube Cloud Scan Results Updated' >> "$GITHUB_STEP_SUMMARY"
+        else
+          echo '## 🔐 SonarQube Cloud Scan' >> "$GITHUB_STEP_SUMMARY"
+          echo '⚠️ No scanner report found; the analysis may not have completed or uploaded.' >> "$GITHUB_STEP_SUMMARY"
+        fi
         echo "🔗 ${DASHBOARD_URL}" >> "$GITHUB_STEP_SUMMARY"
+
+        # Publish the dashboard URL as a step output using the multiline
+        # (delimiter) form so an unexpected newline cannot corrupt the
+        # output file or inject extra outputs.
+        URL_DELIM="URL_EOF_${RANDOM}${RANDOM}"
+        {
+          echo "dashboard_url<<${URL_DELIM}"
+          echo "$DASHBOARD_URL"
+          echo "${URL_DELIM}"
+        } >> "$GITHUB_OUTPUT"
+
+        # Surface the quality gate status when evaluated
+        if [ -n "${QG_STATUS:-}" ]; then
+          echo "- **Quality gate**: ${QG_STATUS}" >> "$GITHUB_STEP_SUMMARY"
+        fi
 
         # Check for NOT_BOUND condition
         if [ "$NOT_BOUND" = "true" ]; then
