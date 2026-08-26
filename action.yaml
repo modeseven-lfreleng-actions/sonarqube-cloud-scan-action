@@ -107,6 +107,9 @@ inputs:
     # an individual argument cannot itself contain spaces (quoting is not
     # preserved). The default tunes the Scanner CLI's cache;
     # sonar-maven-plugin has no equivalent setting and ignores it.
+    # A reference to GITHUB_WORKSPACE, GITHUB_REPOSITORY, GITHUB_REF_NAME,
+    # GITHUB_SHA, GITHUB_RUN_ID, RUNNER_TEMP or RUNNER_OS expands before
+    # the backend runs; every other ${...} reaches the backend as written.
     description: 'Arguments passed to the analysis backend (e.g., "-Dsonar.verbose=true")'
     required: false
     default: '-Dsonar.scanner.cache.enabled=false'
@@ -178,7 +181,8 @@ inputs:
     # Free-form, caller-controlled, same trust model as the 'args' input;
     # e.g. '--settings /path/settings.xml' or '-Dmaven.repo.local=/tmp/r'.
     # Split on whitespace, so an individual argument cannot itself
-    # contain spaces (quoting is not preserved).
+    # contain spaces (quoting is not preserved). Expands the same seven
+    # workspace variables the 'args' input does.
     description: 'Extra arguments appended to the Maven sonar invocation (maven mode)'
     required: false
     default: ''
@@ -437,6 +441,7 @@ runs:
       shell: bash
       env:
         BASE_ARGS: ${{ inputs.args }}
+        MAVEN_ARGS_INPUT: ${{ inputs.maven_args }}
         SONAR_ORG_OVERRIDE: ${{ inputs.sonar_organization }}
         PROJECT_KEY_OVERRIDE: ${{ inputs.sonar_project_key }}
         BRANCH_NAME: ${{ inputs.sonar_branch_name }}
@@ -531,6 +536,80 @@ runs:
         if [ -n "$GERRIT_PROJECT" ]; then
           ARGS="$ARGS -Dsonar.analysis.gerritProjectName=$GERRIT_PROJECT"
         fi
+        # Expand ${VAR} references in the assembled arguments.
+        #
+        # A caller writing an absolute workspace path, such as
+        # -Dsonar.coverage.jacoco.xmlReportPaths=${GITHUB_WORKSPACE}/...,
+        # otherwise sees the literal text: the shell word-splits the
+        # assembled string where it is used but never re-expands ${...}
+        # inside a value, and Maven interpolates ${...} only where a
+        # value reaches it through POM interpolation. Jenkins expanded
+        # these before the scanner ran.
+        #
+        # Applied here so both the CLI and Maven modes benefit.
+        #
+        # Expand a fixed list of workspace variables. Bash string
+        # operations rather than eval or a subprocess: nothing here
+        # executes, so $(...), backticks and $((...)) stay inert, and
+        # the step gains no dependency beyond the shell it already runs
+        # in. The name list is explicit because this step's environment
+        # holds SONAR_TOKEN, which this action deliberately keeps off
+        # the command line; anything outside the list, including Maven's
+        # own ${project.*} and ${settings.*}, passes through for Maven
+        # to resolve.
+        expand_workspace_vars() {
+          local text="$1" out='' head rest raw name value
+          local allow=' GITHUB_WORKSPACE GITHUB_REPOSITORY GITHUB_REF_NAME'
+          allow="$allow GITHUB_SHA GITHUB_RUN_ID RUNNER_TEMP RUNNER_OS "
+          while [ "${text#*'$'}" != "$text" ]; do
+            head="${text%%'$'*}"
+            rest="${text:${#head}+1}"
+            if [[ "$rest" =~ ^\{[A-Za-z_][A-Za-z0-9_]*\} ]]; then
+              raw="$BASH_REMATCH"
+              name="${raw:1:${#raw}-2}"
+            elif [[ "$rest" =~ ^[A-Za-z_][A-Za-z0-9_]* ]]; then
+              raw="$BASH_REMATCH"
+              name="$raw"
+            else
+              # A '$' introducing anything else -- '(', a backtick, a
+              # digit -- keeps its literal text and its meaning here,
+              # which is none.
+              out="$out$head\$"
+              text="$rest"
+              continue
+            fi
+            if [ "${allow#* "$name" }" != "$allow" ]; then
+              value="${!name-}"
+            else
+              value="\$$raw"
+            fi
+            out="$out$head$value"
+            text="${rest:${#raw}}"
+          done
+          printf '%s' "$out$text"
+        }
+        # Both inputs are whitespace-separated argument strings, so a
+        # value carrying a space becomes two arguments wherever it
+        # lands. That holds for the literal text as much as for the
+        # expansion, and a runner whose workspace path carries a space
+        # has no way to write the argument at all. Name it rather than
+        # let the backend fail on an argument nobody wrote.
+        for _name in GITHUB_WORKSPACE GITHUB_REPOSITORY GITHUB_REF_NAME \
+          GITHUB_SHA GITHUB_RUN_ID RUNNER_TEMP RUNNER_OS; do
+          case "$ARGS$MAVEN_ARGS_INPUT" in
+            *"$_name"*)
+              case "${!_name-}" in
+                *[[:space:]]*)
+                  echo "::warning::$_name holds whitespace, so the" \
+                    "backend reads the argument using it as more than" \
+                    "one argument. Use a path without whitespace."
+                  ;;
+              esac
+              ;;
+          esac
+        done
+
+        ARGS="$(expand_workspace_vars "$ARGS")"
         # Use the multiline (delimiter) output form so a newline in any
         # input value cannot break the output file or inject extra outputs.
         ARGS_DELIM="ARGS_EOF_${RANDOM}${RANDOM}"
@@ -609,6 +688,43 @@ runs:
         if [ "$DEBUG" = 'true' ]; then
           VERBOSE='-Dsonar.verbose=true'
         fi
+        # maven_args is a separate input and needs the same treatment
+        # the assembled scanner arguments receive. A composite action
+        # gives each step its own shell, so the helper is repeated
+        # rather than shared; see the scan-args step for why the name
+        # list stays explicit.
+        expand_workspace_vars() {
+          local text="$1" out='' head rest raw name value
+          local allow=' GITHUB_WORKSPACE GITHUB_REPOSITORY GITHUB_REF_NAME'
+          allow="$allow GITHUB_SHA GITHUB_RUN_ID RUNNER_TEMP RUNNER_OS "
+          while [ "${text#*'$'}" != "$text" ]; do
+            head="${text%%'$'*}"
+            rest="${text:${#head}+1}"
+            if [[ "$rest" =~ ^\{[A-Za-z_][A-Za-z0-9_]*\} ]]; then
+              raw="$BASH_REMATCH"
+              name="${raw:1:${#raw}-2}"
+            elif [[ "$rest" =~ ^[A-Za-z_][A-Za-z0-9_]* ]]; then
+              raw="$BASH_REMATCH"
+              name="$raw"
+            else
+              # A '$' introducing anything else -- '(', a backtick, a
+              # digit -- keeps its literal text and its meaning here,
+              # which is none.
+              out="$out$head\$"
+              text="$rest"
+              continue
+            fi
+            if [ "${allow#* "$name" }" != "$allow" ]; then
+              value="${!name-}"
+            else
+              value="\$$raw"
+            fi
+            out="$out$head$value"
+            text="${rest:${#raw}}"
+          done
+          printf '%s' "$out$text"
+        }
+        EXTRA_MAVEN_ARGS="$(expand_workspace_vars "$EXTRA_MAVEN_ARGS")"
         echo "Running Maven goal: ${GOAL}"
         # Word splitting is intentional for the assembled argument
         # strings; both are caller-controlled scanner/Maven flags.

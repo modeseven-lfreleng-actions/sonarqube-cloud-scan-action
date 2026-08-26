@@ -184,6 +184,34 @@ sonar.coverage.jacoco.xmlReportPaths=**/target/site/jacoco/jacoco.xml
 running the SonarQube scan so that the compiled `.class` files exist in the
 `target/` directories.
 
+## Workspace Variables in Arguments
+
+The `args` and `maven_args` inputs expand a fixed list of names before
+the analysis backend runs:
+
+`GITHUB_WORKSPACE`, `GITHUB_REPOSITORY`, `GITHUB_REF_NAME`, `GITHUB_SHA`,
+`GITHUB_RUN_ID`, `RUNNER_TEMP`, `RUNNER_OS`
+
+Both the `${NAME}` and `$NAME` forms work:
+
+```yaml
+maven_args: >-
+  -Dsonar.coverage.jacoco.xmlReportPaths=${GITHUB_WORKSPACE}/target/site/jacoco/jacoco.xml
+```
+
+Every other `${...}` reaches the backend as written, which leaves Maven's
+own `${project.*}` and `${settings.*}` for Maven to resolve. A name
+outside the list stays literal even where the environment holds a value
+for it, `${SONAR_TOKEN}` among them: this step holds credentials, and an
+open substitution would put one on a command line and in the process
+table.
+
+Nothing in the expansion executes, so `$(...)`, backticks and `$((...))`
+reach the backend as written too.
+
+The inputs split on whitespace, so a value carrying a space needs a path
+without one.
+
 ## SonarQube Cloud Documentation
 
 Refer to the links below:

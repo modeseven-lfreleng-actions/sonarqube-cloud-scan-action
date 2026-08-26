@@ -128,6 +128,27 @@ jobs:
           fi
           exit "$RC"
 
+  ### Argument expansion allowlist ###
+  test-argument-expansion:
+    name: 'Test Argument Expansion'
+    runs-on: 'ubuntu-latest'
+    permissions:
+      contents: read
+    timeout-minutes: 5
+    steps:
+      - name: 'Checkout action'
+        # yamllint disable-line rule:line-length
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # The set of names the action expands is a security boundary: the
+      # scan step holds SONAR_TOKEN. Needs no credentials, so it runs on
+      # pull requests, where the scan jobs cannot.
+      - name: 'Check the workspace-variable allowlist'
+        shell: bash
+        run: ./tests/expand-workspace-vars.sh
+
   ### Test the GitHub Action with test-python-project ###
   test-python-project:
     name: 'Test with Python Project'
