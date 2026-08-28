@@ -136,6 +136,18 @@ inputs:
     description: 'Gerrit project name recorded on the analysis (sonar.analysis.gerritProjectName)'
     required: false
     default: ''
+  coverage_report_paths:
+    # Sets sonar.coverage.jacoco.xmlReportPaths, a comma-separated list
+    # of JaCoCo XML report paths. Both analysis modes honour the
+    # property; the primary consumer is CLI mode, which never reads the
+    # Maven project model and so cannot derive report paths itself.
+    # Callers typically wire this from maven-build-action's
+    # coverage_report_paths output. Workspace variable references such
+    # as ${GITHUB_WORKSPACE} expand before the backend runs; see 'args'.
+    # yamllint disable-line rule:line-length
+    description: 'JaCoCo XML report paths recorded on the analysis (sonar.coverage.jacoco.xmlReportPaths)'
+    required: false
+    default: ''
   wait_for_quality_gate:
     description: 'Poll the SonarQube quality gate after the analysis task completes'
     required: false
@@ -447,6 +459,7 @@ runs:
         BRANCH_NAME: ${{ inputs.sonar_branch_name }}
         BRANCH_TARGET: ${{ inputs.sonar_branch_target }}
         GERRIT_PROJECT: ${{ inputs.sonar_gerrit_project }}
+        COVERAGE_REPORT_PATHS: ${{ inputs.coverage_report_paths }}
         SKIP_JRE: ${{ inputs.skip_jre_provisioning }}
         ANALYSIS_MODE: ${{ inputs.analysis_mode }}
         # Effective identifiers the config step resolved from
@@ -487,6 +500,10 @@ runs:
         validate_token 'sonar_branch_name' "$BRANCH_NAME"
         validate_token 'sonar_branch_target' "$BRANCH_TARGET"
         validate_token 'sonar_gerrit_project' "$GERRIT_PROJECT"
+        # coverage_report_paths is validated AFTER expansion, further
+        # down, so a workspace variable resolving to a whitespace-bearing
+        # path (possible on a self-hosted runner) is caught as well as
+        # literal whitespace in the input.
         # skip_jre_provisioning is interpolated into SONAR_SCANNER_OPTS by
         # the CLI scan step; constrain it to a strict boolean so a crafted
         # value cannot smuggle extra JVM/scanner options (free-form flags
@@ -610,6 +627,29 @@ runs:
         done
 
         ARGS="$(expand_workspace_vars "$ARGS")"
+        # The dedicated coverage input expands separately, then is
+        # validated on the RESULT: literal whitespace and a workspace
+        # variable resolving to a whitespace-bearing path (possible on a
+        # self-hosted runner) both produce a value the whitespace-split
+        # argument handling downstream would corrupt, so both fail here.
+        # Expanding the value once, on its own, also keeps the blanket
+        # expansion above from re-expanding anything the substitution
+        # produced. A comma-separated list is still one argument. The
+        # message deliberately does not point at 'args': that input is
+        # word-split too, so it cannot carry such a path either.
+        COVERAGE_REPORT_PATHS="$(expand_workspace_vars "$COVERAGE_REPORT_PATHS")"
+        case "$COVERAGE_REPORT_PATHS" in
+          *[[:space:][:cntrl:]]*)
+            # yamllint disable rule:line-length
+            echo "❌ coverage_report_paths must not contain whitespace or control characters (after workspace variable expansion); report paths containing whitespace are unsupported, as every scanner argument is whitespace-separated" >&2
+            # yamllint enable rule:line-length
+            exit 1
+            ;;
+        esac
+        if [ -n "$COVERAGE_REPORT_PATHS" ]; then
+          # yamllint disable-line rule:line-length
+          ARGS="$ARGS -Dsonar.coverage.jacoco.xmlReportPaths=$COVERAGE_REPORT_PATHS"
+        fi
         # Use the multiline (delimiter) output form so a newline in any
         # input value cannot break the output file or inject extra outputs.
         ARGS_DELIM="ARGS_EOF_${RANDOM}${RANDOM}"

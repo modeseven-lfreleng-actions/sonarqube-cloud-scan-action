@@ -186,7 +186,8 @@ running the SonarQube scan so that the compiled `.class` files exist in the
 
 ## Workspace Variables in Arguments
 
-The `args` and `maven_args` inputs expand a fixed list of names before
+The `args`, `maven_args` and `coverage_report_paths` inputs expand a
+fixed list of names before
 the analysis backend runs:
 
 `GITHUB_WORKSPACE`, `GITHUB_REPOSITORY`, `GITHUB_REF_NAME`, `GITHUB_SHA`,
@@ -195,9 +196,18 @@ the analysis backend runs:
 Both the `${NAME}` and `$NAME` forms work:
 
 ```yaml
-maven_args: >-
-  -Dsonar.coverage.jacoco.xmlReportPaths=${GITHUB_WORKSPACE}/target/site/jacoco/jacoco.xml
+coverage_report_paths: >-
+  ${GITHUB_WORKSPACE}/target/site/jacoco/jacoco.xml
 ```
+
+The `coverage_report_paths` input sets
+`sonar.coverage.jacoco.xmlReportPaths` in both analysis modes; it
+accepts a comma-separated list, and callers running the build with
+[maven-build-action][mba] can wire its `coverage_report_paths` output
+straight through. CLI mode benefits most: unlike Maven mode, it never
+reads the Maven project model, so it cannot derive report paths itself.
+
+[mba]: https://github.com/lfreleng-actions/maven-build-action
 
 Every other `${...}` reaches the backend as written, which leaves Maven's
 own `${project.*}` and `${settings.*}` for Maven to resolve. A name
@@ -250,6 +260,7 @@ For information on the build wrapper for C language based projects:
 | sonar_branch_name            | False    | ''                                                                | Analysis branch name (sonar.branch.name); useful for Gerrit decoration                                                                 |
 | sonar_branch_target          | False    | ''                                                                | Analysis target branch (sonar.branch.target); useful for Gerrit decoration                                                             |
 | sonar_gerrit_project         | False    | ''                                                                | Gerrit project name recorded on the analysis (sonar.analysis.gerritProjectName)                                                        |
+| coverage_report_paths        | False    | ''                                                                | JaCoCo XML report paths recorded on the analysis (sonar.coverage.jacoco.xmlReportPaths)                                                |
 | wait_for_quality_gate        | False    | false                                                             | Poll the SonarQube quality gate after the analysis task completes                                                                      |
 | quality_gate_timeout         | False    | 150                                                               | Wall-clock limit in seconds for quality gate polling (an in-flight API request may extend the step by up to 60 seconds)                |
 | fail_on_quality_gate         | False    | false                                                             | Fail the action when the quality gate status is not OK (requires wait_for_quality_gate: true)                                          |
@@ -404,7 +415,8 @@ separate arguments.
 
 Prefer forms without embedded spaces, and pass identity fields through
 the dedicated inputs (`sonar_project_key`, `sonar_organization`,
-`sonar_branch_name`, `sonar_branch_target`, `sonar_gerrit_project`),
+`sonar_branch_name`, `sonar_branch_target`, `sonar_gerrit_project`,
+`coverage_report_paths`),
 which the action validates and assembles for you.
 
 ### Note: JRE auto-provisioning

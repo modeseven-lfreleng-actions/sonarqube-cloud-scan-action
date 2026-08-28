@@ -74,11 +74,23 @@ jobs:
           # and could invoke a goal other than 'sonar'
           maven_sonar_plugin_version: '5.7.0.6970:help'
 
+      - name: 'Reject coverage report paths carrying whitespace'
+        id: bad-coverage-paths
+        continue-on-error: true
+        uses: ./
+        with:
+          sonar_token: 'placeholder-rejected-before-use'
+          no_checkout: 'true'
+          # Whitespace would split one scanner argument into two;
+          # commas are the list separator
+          coverage_report_paths: 'a/jacoco.xml b/jacoco.xml'
+
       - name: 'Assert all malformed inputs were rejected'
         env:
           BAD_MODE_OUTCOME: ${{ steps.bad-mode.outcome }}
           BAD_VERSION_OUTCOME: ${{ steps.bad-version.outcome }}
           BAD_VERSION_COLON_OUTCOME: ${{ steps.bad-version-colon.outcome }}
+          BAD_COVERAGE_PATHS_OUTCOME: ${{ steps.bad-coverage-paths.outcome }}
         run: |
           # Both malformed inputs must fail the action, and must do so
           # before either analysis backend starts
@@ -106,6 +118,15 @@ jobs:
             # run a goal other than the intended 'sonar'.
             echo '❌ maven_sonar_plugin_version with a colon accepted'
             echo "   outcome: $BAD_VERSION_COLON_OUTCOME"
+            RC=1
+          fi
+          if [ "$BAD_COVERAGE_PATHS_OUTCOME" = 'failure' ]; then
+            echo '✅ coverage_report_paths with whitespace rejected'
+          else
+            # Whitespace splits the property into two scanner arguments,
+            # so the backend would read a truncated path plus garbage.
+            echo '❌ coverage_report_paths with whitespace accepted'
+            echo "   outcome: $BAD_COVERAGE_PATHS_OUTCOME"
             RC=1
           fi
           # A failed outcome on its own is weak evidence: should input
@@ -148,6 +169,14 @@ jobs:
       - name: 'Check the workspace-variable allowlist'
         shell: bash
         run: ./tests/expand-workspace-vars.sh
+
+      # Drives the extracted argument-assembly step body directly, so it
+      # verifies the generated sonar.coverage.jacoco.xmlReportPaths
+      # property (including workspace expansion) in both analysis modes
+      # without needing credentials.
+      - name: 'Check coverage_report_paths assembly'
+        shell: bash
+        run: ./tests/coverage-report-paths.sh
 
   ### Test the GitHub Action with test-python-project ###
   test-python-project:
