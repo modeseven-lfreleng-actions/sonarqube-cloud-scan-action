@@ -178,6 +178,17 @@ jobs:
         shell: bash
         run: ./tests/coverage-report-paths.sh
 
+      # The scanner_args output publishes only what the action derived
+      # from its own typed inputs; the caller's free-form 'args' is
+      # excluded by design. That exclusion is a security boundary --
+      # it removes the channel no bash inspection could police -- so
+      # it is tested here rather than assumed. It does not make the
+      # value generally safe to log: the six typed values are the
+      # caller's own. See the output description.
+      - name: 'Check scanner_args excludes caller args'
+        shell: bash
+        run: ./tests/scanner-args-exclusion.sh
+
   ### Test the GitHub Action with test-python-project ###
   test-python-project:
     name: 'Test with Python Project'
@@ -470,4 +481,56 @@ jobs:
             echo '❌ dashboard URL missing'
             RC=1
           fi
+          exit "$RC"
+
+      # scanner_args exists so a caller can prove a property it
+      # supplied reached the analysis. This leg passes
+      # sonar_gerrit_project, which gives the assertion something
+      # caller-specific to look for: a scan that quietly dropped it
+      # would otherwise succeed and read identically.
+      - name: 'Assert scanner_args reports the arguments used'
+        if: steps.maven-project.outputs.type == 'file'
+        env:
+          SCANNER_ARGS: ${{ steps.maven-scan.outputs.scanner_args }}
+        run: |
+          # Verify the output reaches the action boundary, carries the
+          # caller's property, and leaks no credential.
+          set -euo pipefail
+          echo "scanner_args: ${SCANNER_ARGS:-<empty>}"
+          RC=0
+          if [ -z "${SCANNER_ARGS:-}" ]; then
+            echo '❌ scanner_args empty; the output did not reach the caller'
+            RC=1
+          fi
+          case "${SCANNER_ARGS:-}" in
+            *-Dsonar.analysis.gerritProjectName=nonrtric-plt-rappmanager*)
+              echo '✅ caller-supplied property present in scanner_args'
+              ;;
+            *)
+              echo '❌ sonar_gerrit_project did not reach the analysis'
+              RC=1
+              ;;
+          esac
+          # scanner_args carries only properties this action derived
+          # from its own typed inputs, so no free-form caller text can
+          # appear and no sonar.token-style property can be derived.
+          # It does NOT establish that the six values are themselves
+          # non-sensitive: they are the caller's, and this leg supplies
+          # sonar_gerrit_project deliberately. What this checks is the
+          # narrower, structural claim -- that a credential property
+          # name cannot reach the output.
+          # tests/scanner-args-exclusion.sh covers the exclusion in
+          # detail, without needing credentials.
+          case "${SCANNER_ARGS:-}" in
+            *sonar.token=* | *sonar.login=* | *sonar.password=* | \
+            *sonar.scanner.proxyPassword=* | \
+            *sonar.scanner.truststorePassword=* | \
+            *sonar.scanner.keystorePassword=*)
+              echo '❌ a credential property appeared in scanner_args'
+              RC=1
+              ;;
+            *)
+              echo '✅ no credential property in scanner_args'
+              ;;
+          esac
           exit "$RC"

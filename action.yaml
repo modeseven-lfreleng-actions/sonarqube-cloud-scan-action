@@ -215,6 +215,40 @@ outputs:
   quality_gate_status:
     description: 'Quality gate status (OK, ERROR, NONE, or UNKNOWN)'
     value: ${{ steps.quality-gate.outputs.quality_gate_status || 'UNKNOWN' }}
+  scanner_args:
+    # Published so a caller can verify that a property it supplied
+    # actually reached the analysis. Dropping an input from a caller's
+    # 'with:' block otherwise yields a scan that succeeds and reads
+    # identically, because the backend falls back to its own
+    # discovery -- most sharply for coverage, where the fallback still
+    # reports a figure, just a different one.
+    #
+    # Carries only what this action derives from its own typed inputs.
+    # The free-form 'args' input is excluded by design: a caller can
+    # interpolate a secret into it -- a GitHub expression there
+    # resolves before this action runs -- and no inspection of that
+    # string in bash can reliably tell a credential from ordinary
+    # text, given two backend tokenisers and shell expansion.
+    # Excluding it removes the question. The six typed values are
+    # still the caller's own, so this is a bounded surface rather than
+    # an empty one. See the argument-building step.
+    description: >-
+      The -Dsonar.* properties this action derived from its own inputs
+      (sonar_organization, sonar_project_key, sonar_branch_name,
+      sonar_branch_target, sonar_gerrit_project, coverage_report_paths),
+      after workspace-variable expansion. Excludes the free-form 'args'
+      and maven_args inputs, and excludes arguments each backend adds
+      later (Maven mode appends sonar.host.url, and sonar.verbose when
+      debug is on). Assert on the typed inputs above; a property
+      supplied any other way will not appear. Reports the value as
+      assembled: maven mode expands the argument string unquoted, so a
+      value containing glob syntax can differ from what mvn finally
+      receives. Carries no free-form caller text, so no credential can
+      arrive through 'args'; the six values themselves are still the
+      caller's, so a secret placed in one of those inputs does
+      appear. Empty when the run set none of
+      them, or did not reach the argument-building step.
+    value: ${{ steps.scan-args.outputs.published_args }}
 
 runs:
   using: 'composite'
@@ -482,6 +516,11 @@ runs:
             ;;
         esac
         ARGS="$BASE_ARGS"
+        # The properties this action derives from its own typed
+        # inputs, accumulated separately from the caller's
+        # free-form 'args'. Only this half is published; see the
+        # scanner_args output.
+        DERIVED_ARGS=''
         # The override/branch inputs are documented as simple identity and
         # branch fields and are interpolated into single -Dkey=value tokens.
         # Reject whitespace/control characters so a crafted value cannot
@@ -544,14 +583,31 @@ runs:
         if [ -n "$KEY_VALUE" ]; then
           ARGS="$ARGS -Dsonar.projectKey=$KEY_VALUE"
         fi
+        # The published copy takes the OVERRIDE inputs, not the values
+        # resolved above. The boundary this output draws is not
+        # caller text versus none -- the six typed values are the
+        # caller's -- but the six NAMED inputs versus everything else:
+        # free-form 'args' and, here, the repository's
+        # sonar-project.properties. Publishing a resolved value would
+        # also contradict the contract, which promises an empty value
+        # when none of the typed inputs was set.
+        if [ -n "$SONAR_ORG_OVERRIDE" ]; then
+          DERIVED_ARGS="$DERIVED_ARGS -Dsonar.organization=$SONAR_ORG_OVERRIDE"
+        fi
+        if [ -n "$PROJECT_KEY_OVERRIDE" ]; then
+          DERIVED_ARGS="$DERIVED_ARGS -Dsonar.projectKey=$PROJECT_KEY_OVERRIDE"
+        fi
         if [ -n "$BRANCH_NAME" ]; then
           ARGS="$ARGS -Dsonar.branch.name=$BRANCH_NAME"
+          DERIVED_ARGS="$DERIVED_ARGS -Dsonar.branch.name=$BRANCH_NAME"
         fi
         if [ -n "$BRANCH_TARGET" ]; then
           ARGS="$ARGS -Dsonar.branch.target=$BRANCH_TARGET"
+          DERIVED_ARGS="$DERIVED_ARGS -Dsonar.branch.target=$BRANCH_TARGET"
         fi
         if [ -n "$GERRIT_PROJECT" ]; then
           ARGS="$ARGS -Dsonar.analysis.gerritProjectName=$GERRIT_PROJECT"
+          DERIVED_ARGS="$DERIVED_ARGS -Dsonar.analysis.gerritProjectName=$GERRIT_PROJECT"
         fi
         # Expand ${VAR} references in the assembled arguments.
         #
@@ -627,6 +683,7 @@ runs:
         done
 
         ARGS="$(expand_workspace_vars "$ARGS")"
+        DERIVED_ARGS="$(expand_workspace_vars "$DERIVED_ARGS")"
         # The dedicated coverage input expands separately, then is
         # validated on the RESULT: literal whitespace and a workspace
         # variable resolving to a whitespace-bearing path (possible on a
@@ -649,6 +706,7 @@ runs:
         if [ -n "$COVERAGE_REPORT_PATHS" ]; then
           # yamllint disable-line rule:line-length
           ARGS="$ARGS -Dsonar.coverage.jacoco.xmlReportPaths=$COVERAGE_REPORT_PATHS"
+          DERIVED_ARGS="$DERIVED_ARGS -Dsonar.coverage.jacoco.xmlReportPaths=$COVERAGE_REPORT_PATHS"
         fi
         # Use the multiline (delimiter) output form so a newline in any
         # input value cannot break the output file or inject extra outputs.
@@ -657,6 +715,50 @@ runs:
           echo "args<<${ARGS_DELIM}"
           echo "$ARGS"
           echo "${ARGS_DELIM}"
+        } >> "$GITHUB_OUTPUT"
+        # The scanner_args output publishes DERIVED_ARGS -- what this
+        # action assembled from its own typed inputs -- and never the
+        # caller's free-form 'args'.
+        #
+        # An earlier revision published the whole assembled string and
+        # tried to withhold it when 'args' carried a credential
+        # property. Review found seven ways past that check in
+        # succession: the redaction boundary, secrets containing
+        # whitespace, flat-text matching, multiline values, two
+        # tokenisers disagreeing about quotes, the wider JavaScript
+        # whitespace set, and Maven's pathname expansion. Each fix was
+        # correct and each exposed another gap, because the string is
+        # free-form text consumed by two different parsers plus the
+        # shell, and no bash approximation of all three is
+        # trustworthy.
+        #
+        # Excluding 'args' removes the question rather than
+        # answering it. What remains is bounded: six named inputs
+        # whose values this action places itself, with no detection to
+        # bypass, no false positive to document and no warning to
+        # misword.
+        #
+        # That is narrower than "safe to log". Those six values are
+        # still caller-supplied, and a secrets expression in one of
+        # them resolves before this step too, so a secret placed in
+        # sonar_project_key appears here.
+        # The difference is that the channel is now predictable: the
+        # fields are identifiers, branch names and report paths rather
+        # than free-form text, none is a credential field, and a
+        # caller can see at a glance which of their inputs reach the
+        # output.
+        #
+        # The cost is that a property supplied through 'args' cannot
+        # be asserted on. The typed inputs can, which is what the
+        # output exists for: sonar_organization, sonar_project_key,
+        # sonar_branch_name, sonar_branch_target, sonar_gerrit_project
+        # and coverage_report_paths all appear here.
+        PUBLISHED_ARGS="${DERIVED_ARGS# }"
+        PUB_DELIM="PUB_EOF_${RANDOM}${RANDOM}"
+        {
+          echo "published_args<<${PUB_DELIM}"
+          echo "$PUBLISHED_ARGS"
+          echo "${PUB_DELIM}"
         } >> "$GITHUB_OUTPUT"
 
     - name: 'SonarQube Scan'
