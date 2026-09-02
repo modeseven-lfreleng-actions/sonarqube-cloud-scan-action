@@ -274,13 +274,14 @@ For information on the build wrapper for C language based projects:
 
 <!-- markdownlint-disable MD013 -->
 
-| Output Name         | Description                                             |
-| ------------------- | ------------------------------------------------------- |
-| sonar_org           | SonarQube organization                                  |
-| project_key         | SonarQube project key                                   |
-| config_file         | Path to the SonarQube configuration file                |
-| dashboard_url       | SonarQube dashboard URL for the analysed project        |
-| quality_gate_status | Quality gate status (see values below)                  |
+| Output Name         | Description                                      |
+| ------------------- | ------------------------------------------------ |
+| sonar_org           | SonarQube organization                           |
+| project_key         | SonarQube project key                            |
+| config_file         | Path to the SonarQube configuration file         |
+| dashboard_url       | SonarQube dashboard URL for the analysed project |
+| quality_gate_status | Quality gate status (see values below)           |
+| scanner_args        | Assembled `-Dsonar.*` arguments (see note below) |
 
 <!-- markdownlint-enable MD013 -->
 
@@ -418,6 +419,135 @@ the dedicated inputs (`sonar_project_key`, `sonar_organization`,
 `sonar_branch_name`, `sonar_branch_target`, `sonar_gerrit_project`,
 `coverage_report_paths`),
 which the action validates and assembles for you.
+
+### Note: Asserting on scanner arguments
+
+The `scanner_args` output carries the `-Dsonar.*` properties this
+action derives from its own typed inputs, after workspace-variable
+expansion. It exists so a caller can prove a property it supplied
+reached the scan.
+
+That matters because the failure is silent. Drop an input from a
+caller's `with:` block and the scan still succeeds, because the
+backend falls back to its own discovery. Coverage is the sharpest
+case: `sonar.coverage.jacoco.xmlReportPaths` going missing does not
+produce an error, it produces a *different* coverage figure, which is
+indistinguishable from a correct one.
+
+```yaml
+      - name: 'Scan'
+        id: scan
+        uses: lfreleng-actions/sonarqube-cloud-scan-action@<sha>
+        with:
+          sonar_token: ${{ secrets.SONAR_TOKEN }}
+          coverage_report_paths: ${{ steps.build.outputs.coverage_report_paths }}
+
+      - name: 'Confirm coverage reached the analysis'
+        shell: bash
+        env:
+          ARGS: ${{ steps.scan.outputs.scanner_args }}
+          EXPECTED: ${{ steps.build.outputs.coverage_report_paths }}
+        run: |
+          # Compare the value, not the property name alone: matching
+          # the name still passes when the scan lost or replaced the
+          # paths, which is the failure this check exists for.
+          if [ -z "${EXPECTED}" ]; then
+            echo '::error::The build produced no coverage report paths'
+            exit 1
+          fi
+          # Pad both sides so the pattern matches a WHOLE argument.
+          # Without the trailing space, EXPECTED=report.xml would also
+          # match an argument ending report.xml.bak.
+          case " ${ARGS} " in
+            *" -Dsonar.coverage.jacoco.xmlReportPaths=${EXPECTED} "*) ;;
+            *)
+              echo '::error::Coverage paths did not reach the scan'
+              echo "  expected: ${EXPECTED}"
+              echo "  actual:   ${ARGS}"
+              exit 1
+              ;;
+          esac
+```
+
+The output carries values after workspace-variable expansion, so a
+path written as `${GITHUB_WORKSPACE}/target/...` appears resolved.
+Compare against the expanded form, or keep those variables out of the
+value you assert on.
+
+#### What it covers
+
+Properties this action builds from its own inputs:
+
+<!-- markdownlint-disable MD013 -->
+
+| Input                   | Property                               |
+| ----------------------- | -------------------------------------- |
+| `sonar_organization`    | `sonar.organization`                   |
+| `sonar_project_key`     | `sonar.projectKey`                     |
+| `sonar_branch_name`     | `sonar.branch.name`                    |
+| `sonar_branch_target`   | `sonar.branch.target`                  |
+| `sonar_gerrit_project`  | `sonar.analysis.gerritProjectName`     |
+| `coverage_report_paths` | `sonar.coverage.jacoco.xmlReportPaths` |
+
+<!-- markdownlint-enable MD013 -->
+
+#### What it does not cover
+
+- **The free-form `args` input**, by design. See below.
+- **`maven_args`**, which `maven` mode expands separately into the
+  same `mvn` invocation.
+- **Arguments each backend adds later.** Maven mode appends
+  `-Dsonar.host.url`, and `-Dsonar.verbose` when `debug` is on, after
+  the action builds this value. So a property from `sonar_host_url`
+  will not appear here even though the analysis received it.
+- **Changes the backend makes to the string.** Maven mode expands the
+  argument string unquoted, which also performs pathname expansion, so
+  a value containing glob syntax can reach `mvn` in a different form
+  from the one reported here.
+
+Assert on the typed inputs in the table; anything reaching the backend
+another way produces a false failure.
+
+#### What the output can contain
+
+The action places no credential here itself. The six values above are
+the caller's own, though, and GitHub resolves a secret expression in a
+typed input before the action runs, so
+`sonar_project_key: ${{ secrets.INTERNAL_KEY }}` does appear in this
+output.
+
+The output is **bounded** rather than unconditionally safe to log: six
+named fields holding identifiers, branch names and report paths, none
+of them a credential field, each visible at the call site. Treat the
+output as sensitive if you put something sensitive in those six
+inputs.
+
+#### Why the action excludes `args`
+
+This action puts no credential on the command line — `sonar_token`
+reaches the backends through the environment, and the quality gate
+through a curl config file on stdin. A caller can, though, because a
+GitHub expression in `args` resolves before the action runs:
+
+```yaml
+          # Do NOT do this. The token is visible in the runner's
+          # process list, and the legacy sonar.login property is
+          # deprecated. Use the sonar_token input instead.
+          args: -Dsonar.login=${{ secrets.SONAR_TOKEN }}
+```
+
+An earlier revision of this output published the whole assembled
+string and tried to detect that case. Nothing made it reliable:
+the string is free-form text read by `parseArgsStringToArgv` in CLI
+mode, by shell word-splitting *and* pathname expansion in Maven mode,
+and the two disagree about quoting. Review found seven distinct ways
+past successive versions of the check.
+
+Publishing what the action itself derived removes the question. No
+`args` content reaches this output, so nothing a caller writes *there*
+can, whatever they put in it and whichever way the backend reads it.
+The six typed values remain, which is why the section above bounds the
+claim rather than dropping it.
 
 ### Note: JRE auto-provisioning
 
